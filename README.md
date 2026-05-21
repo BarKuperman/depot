@@ -73,6 +73,9 @@ custom maps.  This is handled through the `MapGen` class.
 | `cities`           | list of str. OSM 'place' values to show at the lowest zooms. If None, labels will not be created for that zoom. Default: None         |
 | `suburbs`          | list of str. Like cities, but for medium zooms. Default: None         |
 | `neighborhoods`    | list of str. Like cities, but for the highest zooms. Default: None         |
+| `cities_additional`        | str. Path/to/geojson file that contains label features to be shown at the lowest zoom levels. If None, it is not used. Default: None |
+| `suburbs_additional`       | str. Like `cities_additional`, but for medium zooms. |
+| `neighborhoods_additional` | str. `Like cities_additional`, but for the highest zooms. |
 | `places_suffix`    | str. Suffix to add after the `place` tag when pulling labels from OSM. For example, if using Chinese labels, set this to "CN" to pull from `place:CN`. Default: "" |
 | `label_name_language`   | str or None. Controls which name field is used for label text. Use `prefer:<lang>` to try `name:<lang>` first and fall back to `name`, or `force:<lang>` to use only `name:<lang>`. Default: None |
 | `road_name_preferred_language`             | str or None. Preferred OSM language code suffix for road names in `roads.geojson`. For example, `en` prefers `name:en` and falls back to `name`. Default: None |
