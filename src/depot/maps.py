@@ -905,6 +905,50 @@ class MapGen:
                 if primary_id is not None:
                     water_feat["id"] = primary_id
                 new_layers_data["water"].append(water_feat)
+
+            # ── Clip landuse against the dissolved water mask ───────────
+            # OSM `landuse=park` (and the other green/recreational classes
+            # that collapse to kind='park' in _get_kind_and_rank) frequently
+            # extends over rivers, harbours, caldera lakes, etc. Without
+            # subtracting water, those polygons bleed over the rendered
+            # water layer at intermediate zooms.
+            #
+            # Per-tile rather than per-zoom-band: the merged water geometry
+            # is already at this tile's resolution (via set_precision +
+            # grid snap above), so subtracting from same-tile landuse is
+            # geometrically consistent by construction.
+            if "landuse" in new_layers_data and merged_result is not None \
+                    and not merged_result.is_empty:
+                kept = []
+                for feat in new_layers_data["landuse"]:
+                    if feat["properties"].get("kind") != "park":
+                        kept.append(feat)
+                        continue
+                    geom = shape(feat["geometry"])
+                    if not geom.intersects(merged_result):
+                        kept.append(feat)
+                        continue
+                    clipped = geom.difference(merged_result)
+                    if not clipped.is_valid:
+                        clipped = clipped.buffer(0)
+                    if clipped.is_empty or clipped.area < 1.0:
+                        continue  # whole feature was over water — drop
+                    # difference() can yield GeometryCollections; keep only
+                    # Polygon/MultiPolygon parts (matches the spec the rest
+                    # of this worker enforces).
+                    if clipped.geom_type not in ("Polygon", "MultiPolygon"):
+                        parts = [
+                            g for g in clipped.geoms
+                            if g.geom_type in ("Polygon", "MultiPolygon")
+                        ]
+                        if not parts:
+                            continue
+                        clipped = unary_union(parts) if len(parts) > 1 \
+                                  else parts[0]
+                    feat["geometry"] = mapping(clipped)
+                    kept.append(feat)
+                new_layers_data["landuse"] = kept
+
         layers_to_encode = []
         for name, feats in new_layers_data.items():
             if not feats: continue
