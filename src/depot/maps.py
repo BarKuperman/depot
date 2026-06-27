@@ -65,6 +65,7 @@ class MapGen:
     def __init__(self, city, bbox, osmpbf=None, outputdir='.', 
                        building_index_filter_size=40, 
                        building_tile_filter_size=None, 
+                       exclude_train_station_buildings=False,
                        building_index_simplification=1,
                        building_tile_simplification=1,
                        max_building_tile_size=450,
@@ -102,6 +103,9 @@ class MapGen:
                          at the highest zooms.  Must be >= building_index_filter_size.
                          If None, uses `building_index_filter_size`.
                          Default: None
+        exclude_train_station_buildings: bool. If True, excludes buildings with
+                         Overture class `train_station` from building outputs.
+                         Default: False
         building_index_simplification: int or float. Minimum distance in 
                                 meters between building nodes.  Higher values 
                                 reduce buildings_index.json file size at the 
@@ -191,6 +195,7 @@ class MapGen:
                 self.osmpbf = osmpbf[0]
         self.buildings_geojson = buildings_geojson
         self.REFETCH_BUILDINGS = bool(redownload_buildings)
+        self.exclude_train_station_buildings = bool(exclude_train_station_buildings)
         self.color_military_like_aerodrome = bool(color_military_like_aerodrome)
         self.ncores = ncores
         self.RAM = RAM # Multiplied by 1000 in the setter to convert GB -> MB
@@ -245,6 +250,7 @@ class MapGen:
             print(f"redownload_buildings: {self.REFETCH_BUILDINGS}")
             print(f"building_index_filter_size: {self.building_index_filter_size} m2")
             print(f"building_tile_filter_size : {self.building_tile_filter_size} m2")
+            print(f"exclude_train_station_buildings: {self.exclude_train_station_buildings}")
             print(f"ncores              : {self.ncores}")
             print(f"RAM                 : {self.RAM} MB")
             print(f"cleanup_files       : {self.cleanup_files}")
@@ -278,6 +284,12 @@ class MapGen:
         osmium_cmd.extend(["-o", merged_osmpbf, "--overwrite"])
         self._run_command(osmium_cmd)
         self.osmpbf = merged_osmpbf
+
+    def _building_mapshaper_filter(self):
+        building_filter = f"this.area > {self.building_index_filter_size}"
+        if self.exclude_train_station_buildings:
+            building_filter += ' && this.properties.class != "train_station"'
+        return building_filter
     
     def extract_base_data(self):
         """
@@ -773,7 +785,8 @@ class MapGen:
                 id,
                 geometry,
                 names.primary as name,
-                height
+                height,
+                class
             FROM read_parquet('{s3_path}', hive_partitioning=1)
             WHERE bbox.xmin >= {self.bbox[0]} AND bbox.xmax <= {self.bbox[2]}
               AND bbox.ymin >= {self.bbox[1]} AND bbox.ymax <= {self.bbox[3]}
@@ -852,10 +865,11 @@ class MapGen:
 
         # 2. Mapshaper Cleanup
         cleaned_json = os.path.join(self.city_dir, "buildings_cleaned.json")
+        building_filter = self._building_mapshaper_filter()
         mapshaper_cmd = (
             f"node --max-old-space-size={self.RAM} $(which mapshaper) "
             f"{self.buildings_geojson} -proj {self.epsg} -snap 0.5 -clean "
-            f"-filter 'this.area > {self.building_index_filter_size}' "
+            f"-filter '{building_filter}' "
             f"-simplify dp interval={self.building_index_simplification} "
             f"-proj wgs84 -o precision=0.00001 {cleaned_json}"
         )
@@ -1338,12 +1352,13 @@ class MapGen:
         if self.buildings_geojson is None:
             self.buildings_geojson = os.path.join(self.city_dir, "buildings.geojson")
         self.buildings_zoom_geojson = os.path.join(self.city_dir, "buildings_zoom.geojson")
+
         
-        
+        building_filter = self._building_mapshaper_filter()
         mapshaper_cmd = (
             f"node --max-old-space-size={self.RAM} $(which mapshaper) "
             f"{self.buildings_geojson} -proj {self.epsg} -snap 0.5 "
-            f"-filter 'this.area > {self.building_index_filter_size}' -clean "
+            f"-filter '{building_filter}' -clean "
             f"-simplify dp interval={self.building_tile_simplification} "
             f"-proj wgs84 -o precision=0.00001 {self.buildings_zoom_geojson}"
         )

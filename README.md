@@ -67,6 +67,7 @@ custom maps.  This is handled through the `MapGen` class.
 | `outputdir`        | str. Path to output directory. Within the specified directory, a new directory named `city` will be created to hold all outputs and intermediate files. Defaults to the current directory. Default: current working directory         |
 | `building_index_filter_size`     | int. Filters buildings below this size (in m^2) for collisions. Default: 40         |
 | `building_tile_filter_size`      | int. Filters buildings below this size (in m^2) for pmtiles. Must be <= `building_index_filter_size`.  If None, it is set to `building_index_filter_size`. Default: None         |
+| `exclude_train_station_buildings` | bool. If True, excludes Overture buildings with class `train_station` from building outputs. Default: False |
 | `building_index_simplification`  | int or float. Minimum distance in meters between building nodes.  Higher values reduce buildings_index.json file size at the cost of reduced accuracy.  Be careful to not use too large of a value. Default: 1 |
 | `building_tile_simplification`   | int or float. Like `building_index_simplification`, but for the buildings in the pmtiles file. |
 | `max_building_tile_size`         | int. Maximum size per tile in KB when considering only buildings. The absolute maximum per tile is 500, which includes buildings, rivers, roads, and more. Default: 450  |
