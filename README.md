@@ -11,7 +11,9 @@ This library is confirmed to work with the following Python package versions:
 | duckdb             | 1.5.1         |
 | geopandas          | 1.1.1         |
 | mapbox_vector_tile | 2.2.0         |
+| matplotlib         | 3.10.9        |
 | numpy              | 2.3.5         |
+| scipy              | 1.17.1        |
 | pandas             | 2.3.3         |
 | shapely            | 2.1.2         |
 | duckdb             | 1.5.1         |
