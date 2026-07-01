@@ -1336,7 +1336,8 @@ class MapGen:
                 if not current_geom.is_empty and current_geom.area > 1e-9:
                     contours_by_level.append((current_level, current_geom))
         else:
-            print("  No ocean depths detected")
+            if self.verb:
+                print("  No ocean depths detected")
             contours_by_level = []
         
         if self.raw_mbtiles is None or not os.path.exists(self.raw_mbtiles):
