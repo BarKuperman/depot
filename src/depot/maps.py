@@ -1051,8 +1051,11 @@ class MapGen:
         
         # Ensure ocean depth data is available
         if self.create_ocean_foundations:
+            # Ocean depth index
             if self.bathy_data is None:
                 self.load_bathymetry_data()
+            # Ocean depth map layer
+            self._generate_ocean_depth_tiles()
         
         if self.cleanup_files:
             os.remove(self.raw_mbtiles)
@@ -1061,8 +1064,7 @@ class MapGen:
         # 4. Building overlays, including foundations
         self._generate_building_tiles()
         
-        # Ocean depth layer
-        self._generate_ocean_depth_tiles()
+
 
         # Clean metadata
         self._update_mbtiles_metadata(fixed_mbtiles)
@@ -1246,93 +1248,97 @@ class MapGen:
         lats = self.bathy.lat.values
         depths = self.bathy.values
         
-        # Set up depth contour levels (strictly below sea level)
-        true_min = float(depths.min())
-        interval_start = int(np.ceil(true_min / float(depth_step)) * int(depth_step))
-        clean_steps = np.arange(interval_start, 0.1, int(depth_step)) 
-        DEPTH_LEVELS = np.unique(np.insert(clean_steps, 0, true_min))
-        DEPTH_LEVELS = DEPTH_LEVELS[DEPTH_LEVELS < 0] 
-        
-        # Increase the resolution multiplier for smoother curves
-        dense_lons = np.linspace(lons[0], lons[-1], len(lons) * resolution_multiplier)
-        dense_lats = np.linspace(lats[0], lats[-1], len(lats) * resolution_multiplier)
-        dense_mesh_lon, dense_mesh_lat = np.meshgrid(dense_lons, dense_lats)
-        interp_func = RegularGridInterpolator(
-            (lats, lons), 
-            depths, 
-            method='cubic',  
-            bounds_error=False, 
-            fill_value=None
-        )
-        interp_points = np.stack([dense_mesh_lat.ravel(), dense_mesh_lon.ravel()], axis=-1)
-        dense_depths = interp_func(interp_points).reshape(dense_mesh_lon.shape)
-        
-        # Generate contours
-        fig, ax = plt.subplots()
-        contour_set = ax.contourf(dense_lons, dense_lats, dense_depths, levels=DEPTH_LEVELS)
-        plt.close(fig)
-
-        # First Pass: Group geometries by depth level
-        raw_stacked_contours = []
-        for i in range(len(contour_set.allsegs)):
-            segments = contour_set.allsegs[i]
-            level = contour_set.levels[i] 
-            if level >= 0 or not segments:
-                continue
+        if depths.min() < 0:
+            # Set up depth contour levels (strictly below sea level)
+            true_min = float(depths.min())
+            interval_start = int(np.ceil(true_min / float(depth_step)) * int(depth_step))
+            clean_steps = np.arange(interval_start, 0.1, int(depth_step)) 
+            DEPTH_LEVELS = np.unique(np.insert(clean_steps, 0, true_min))
+            DEPTH_LEVELS = DEPTH_LEVELS[DEPTH_LEVELS < 0] 
             
-            level_polys = []
-            for seg in segments:
-                if len(seg) < 3:
+            # Increase the resolution multiplier for smoother curves
+            dense_lons = np.linspace(lons[0], lons[-1], len(lons) * resolution_multiplier)
+            dense_lats = np.linspace(lats[0], lats[-1], len(lats) * resolution_multiplier)
+            dense_mesh_lon, dense_mesh_lat = np.meshgrid(dense_lons, dense_lats)
+            interp_func = RegularGridInterpolator(
+                (lats, lons), 
+                depths, 
+                method='cubic',  
+                bounds_error=False, 
+                fill_value=None
+            )
+            interp_points = np.stack([dense_mesh_lat.ravel(), dense_mesh_lon.ravel()], axis=-1)
+            dense_depths = interp_func(interp_points).reshape(dense_mesh_lon.shape)
+            
+            # Generate contours
+            fig, ax = plt.subplots()
+            contour_set = ax.contourf(dense_lons, dense_lats, dense_depths, levels=DEPTH_LEVELS)
+            plt.close(fig)
+
+            # First Pass: Group geometries by depth level
+            raw_stacked_contours = []
+            for i in range(len(contour_set.allsegs)):
+                segments = contour_set.allsegs[i]
+                level = contour_set.levels[i] 
+                if level >= 0 or not segments:
                     continue
-                coords = seg.tolist()
-                if coords[0] != coords[-1]:
-                    coords.append(coords[0])
-                    
-                try:
-                    poly_geo = Polygon(coords)
-                    if not poly_geo.is_valid:
-                        poly_geo = poly_geo.buffer(0)
-                    if not poly_geo.is_empty and poly_geo.area > 0:
-                        if poly_geo.geom_type == "Polygon":
-                            level_polys.append(poly_geo)
-                        elif poly_geo.geom_type == "MultiPolygon":
-                            level_polys.extend(list(poly_geo.geoms))
-                except Exception:
-                    continue
-                    
-            if level_polys:
-                raw_stacked_contours.append((level, unary_union(level_polys)))
-
-        # Sort from deepest to shallowest (ascending order: e.g., -16, -12, -8, -4)
-        # This ensures we process the deep layers first so shallow layers can slice them up
-        raw_stacked_contours.sort(key=lambda x: x[0], reverse=False)
-
-        # Corrected Pass: Deeper polygons get clipped by shallower ones
-        contours_by_level = []
-        
-        for i in range(len(raw_stacked_contours)):
-            current_level, current_geom = raw_stacked_contours[i]
-            
-            # Look ahead in our deepest-to-shallowest array to find all shallower layers
-            # Subtract every shallower polygon that overlaps this deep one
-            shallower_geoms = [
-                sh_geom for sh_lvl, sh_geom in raw_stacked_contours[i+1:] 
-                if sh_lvl > current_level
-            ]
-            
-            if shallower_geoms:
-                # Combine all shallow caps into one unified cutter mask
-                shallow_mask = unary_union(shallower_geoms)
-                if current_geom.intersects(shallow_mask):
-                    # Punch holes in the deep trench where the shallow shelf caps it
-                    current_geom = current_geom.difference(shallow_mask)
-            
-            if not current_geom.is_valid:
-                current_geom = current_geom.buffer(0)
                 
-            if not current_geom.is_empty and current_geom.area > 1e-9:
-                contours_by_level.append((current_level, current_geom))
-        
+                level_polys = []
+                for seg in segments:
+                    if len(seg) < 3:
+                        continue
+                    coords = seg.tolist()
+                    if coords[0] != coords[-1]:
+                        coords.append(coords[0])
+                        
+                    try:
+                        poly_geo = Polygon(coords)
+                        if not poly_geo.is_valid:
+                            poly_geo = poly_geo.buffer(0)
+                        if not poly_geo.is_empty and poly_geo.area > 0:
+                            if poly_geo.geom_type == "Polygon":
+                                level_polys.append(poly_geo)
+                            elif poly_geo.geom_type == "MultiPolygon":
+                                level_polys.extend(list(poly_geo.geoms))
+                    except Exception:
+                        continue
+                        
+                if level_polys:
+                    raw_stacked_contours.append((level, unary_union(level_polys)))
+
+            # Sort from deepest to shallowest (ascending order: e.g., -16, -12, -8, -4)
+            # This ensures we process the deep layers first so shallow layers can slice them up
+            raw_stacked_contours.sort(key=lambda x: x[0], reverse=False)
+
+            # Corrected Pass: Deeper polygons get clipped by shallower ones
+            contours_by_level = []
+            
+            for i in range(len(raw_stacked_contours)):
+                current_level, current_geom = raw_stacked_contours[i]
+                
+                # Look ahead in our deepest-to-shallowest array to find all shallower layers
+                # Subtract every shallower polygon that overlaps this deep one
+                shallower_geoms = [
+                    sh_geom for sh_lvl, sh_geom in raw_stacked_contours[i+1:] 
+                    if sh_lvl > current_level
+                ]
+                
+                if shallower_geoms:
+                    # Combine all shallow caps into one unified cutter mask
+                    shallow_mask = unary_union(shallower_geoms)
+                    if current_geom.intersects(shallow_mask):
+                        # Punch holes in the deep trench where the shallow shelf caps it
+                        current_geom = current_geom.difference(shallow_mask)
+                
+                if not current_geom.is_valid:
+                    current_geom = current_geom.buffer(0)
+                    
+                if not current_geom.is_empty and current_geom.area > 1e-9:
+                    contours_by_level.append((current_level, current_geom))
+        else:
+            if self.verb:
+                print("  No ocean depths detected")
+            contours_by_level = []
         
         if self.raw_mbtiles is None or not os.path.exists(self.raw_mbtiles):
             raise FileNotFoundError(f"Valid MBTiles source path required for water parsing. Got: {self.raw_mbtiles}")
@@ -1342,7 +1348,9 @@ class MapGen:
             
         water_polygons = []
         # Target high resolution Zoom level `self.maxzoom`
-        tiles = list(mercantile.tiles(self.bbox[0], self.bbox[1], self.bbox[2], self.bbox[3], self.maxzoom))
+        tiles = list(mercantile.tiles(self.bbox[0], self.bbox[1], 
+                                      self.bbox[2], self.bbox[3], 
+                                      self.maxzoom))
         
         conn = sqlite3.connect(self.raw_mbtiles)
         cursor = conn.cursor()
