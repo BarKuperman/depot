@@ -8,7 +8,7 @@ import struct
 import gzip
 import math
 import xarray as xr
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import sqlite3
 import zlib
@@ -16,6 +16,7 @@ import mapbox_vector_tile
 import duckdb
 import geopandas as gpd
 import pandas as pd
+import shapely
 from shapely import wkb, set_precision
 from shapely.ops import unary_union, orient
 from shapely.geometry import shape, mapping, box, Polygon, MultiPolygon, Point, LineString
@@ -23,6 +24,7 @@ from shapely.strtree import STRtree
 import matplotlib.pyplot as plt
 import mercantile
 from scipy.interpolate import RegularGridInterpolator
+from tqdm import tqdm
 
 import depot.utils as U
 
@@ -1516,55 +1518,67 @@ class MapGen:
         }
 
         # Evaluate cells
-        for cx in range(len(grid_x)):
-            cell_min_x = min_lon + (cx * step_x)
-            cell_max_x = min_lon + ((cx + 1) * step_x)
+        if self.verb:
+            print("  Evaluating cells")
+        
+        # Sanitize contours
+        valid_water_contours = []
+        for level, geom in water_clipped_contours:
+            if not shapely.is_valid(geom):
+                geom = shapely.make_valid(geom)
+            valid_water_contours.append((level, geom))
+
+        # Precompute Y bounds
+        y_bounds = [(min_lat + (cy * step_y), min_lat + ((cy + 1) * step_y)) for cy in range(len(grid_y))]
+        
+        # Select optimal number of parallel workers
+        # Never use more than 1/2 the available cores
+        ncores = max(1, min(self.ncores, os.cpu_count() // 2))
+        if self.verb:
+            core_str = "core" if ncores == 1 else "cores"
+            print(f"  Processing ocean depth indices using {ncores} {core_str}")
+        
+        all_cx = list(range(len(grid_x)))
+        chunk_size = int(math.ceil(len(all_cx) / ncores))
+        cx_chunks = [all_cx[i:i + chunk_size] for i in range(0, len(all_cx), chunk_size)]
+        
+        # Calculate depth indices in parallel
+        parallel_results = []
+        with ProcessPoolExecutor(max_workers=ncores) as executor:
+            # Submit all chunks to start running in parallel immediately
+            futures = {
+                executor.submit(
+                    self._process_columns_worker,
+                    chunk, min_lon, step_x, step_y, len(grid_y), y_bounds,
+                    spatial_tree, valid_water_contours, final_level_cache
+                ): chunk 
+                for chunk in cx_chunks
+            }
             
-            for cy in range(len(grid_y)):
-                cell_min_y = min_lat + (cy * step_y)
-                cell_max_y = min_lat + ((cy + 1) * step_y)
-                cell_poly = box(cell_min_x, cell_min_y, cell_max_x, cell_max_y)
-                
-                # Query the tree to return the matching integer indices instead of raw objects
-                intersecting_indices = spatial_tree.query(cell_poly)
-                
-                for idx in intersecting_indices:
-                    # Pull the original level and geometry using the stable list index
-                    level, level_geom = water_clipped_contours[idx]
+            # Wrap as_completed with tqdm to display a live progress bar
+            # This is kind of useless now that it is multi-threaded, but it's 
+            # from when the code was single-threaded so I am lazily keeping it
+            with tqdm(total=len(futures), desc="Processing Grid Chunks", unit="chunk") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        parallel_results.append(result)
+                    except Exception as e:
+                        print(f"\n[ERROR] Chunk failed with exception: {e}")
                     
-                    # Short-circuit logic: Is the cell completely submerged within this level?
-                    if cell_poly.within(level_geom):
-                        clipped_parts = [cell_poly]
-                    else:
-                        clipped = cell_poly.intersection(level_geom)
-                        if clipped.is_empty or clipped.area <= 1e-9:
-                            continue
-                        clipped_parts = _iter_polygon_parts(clipped)
-                        
-                    for part in clipped_parts:
-                        if part.is_empty:
-                            continue
-                        
-                        # Clean up bounds and coords
-                        exterior_poly = Polygon(part.exterior)
-                        exterior = [[round(c[0], 6), round(c[1], 6)] 
-                                    for c in exterior_poly.exterior.coords]
-                        holes = [[[round(c[0], 6), round(c[1], 6)] 
-                                  for c in hole.coords] 
-                                 for hole in part.interiors]
-                        
-                        pb = [round(x, 6) for x in exterior_poly.bounds]
-                        
-                        final_level = final_level_cache[level]
-                        entry_index = len(depth_entries)
-                        
-                        depth_entries.append({
-                            "b": pb,
-                            "d": final_level,
-                            "p": [exterior] + holes,
-                        })
-                        
-                        cell_refs.setdefault((cx, cy), []).append(entry_index)
+                    pbar.update(1)  # Advance the progress bar by 1 completed chunk
+
+        # Merge isolated process outputs sequentially back into the instance payload
+        depth_entries = []
+        cell_refs = {}
+        global_entry_offset = 0
+
+        for local_depth_entries, local_cell_refs in parallel_results:
+            depth_entries.extend(local_depth_entries)
+            for (cx, cy), indices in local_cell_refs.items():
+                global_indices = [idx + global_entry_offset for idx in indices]
+                cell_refs.setdefault((cx, cy), []).extend(global_indices)
+            global_entry_offset += len(local_depth_entries)
         
         # Format sparse lookup list
         cells = [
@@ -1596,6 +1610,65 @@ class MapGen:
         
         if self.verb:
             print(f"Successfully generated ocean depth index. Processed {len(cells)} active grid cells.")
+    
+    @staticmethod
+    def _process_columns_worker(cx_chunk, min_lon, step_x, step_y, grid_y_len, y_bounds, 
+                                spatial_tree, valid_water_contours, final_level_cache):
+        """ Runs in an isolated process. No access to `self` to avoid Pickling Errors. """
+        local_depth_entries = []
+        local_cell_refs = {}
+        
+        def _iter_polygon_parts(geom):
+            if geom.geom_type == "Polygon":
+                return [geom]
+            elif geom.geom_type == "MultiPolygon":
+                return list(geom.geoms)
+            return []
+
+        for cx in cx_chunk:
+            cell_min_x = min_lon + (cx * step_x)
+            cell_max_x = min_lon + ((cx + 1) * step_x)
+            
+            for cy in range(grid_y_len):
+                cell_min_y, cell_max_y = y_bounds[cy]
+                cell_poly = box(cell_min_x, cell_min_y, cell_max_x, cell_max_y)
+                
+                intersecting_indices = spatial_tree.query(cell_poly)
+                
+                for idx in intersecting_indices:
+                    level, level_geom = valid_water_contours[idx]
+                    
+                    if cell_poly.within(level_geom):
+                        clipped_parts = [cell_poly]
+                    else:
+                        clipped = shapely.clip_by_rect(
+                            level_geom, 
+                            cell_min_x, cell_min_y, 
+                            cell_max_x, cell_max_y
+                        )
+                        if clipped.is_empty or clipped.area <= 1e-9:
+                            continue
+                        clipped_parts = _iter_polygon_parts(clipped)
+                        
+                    for part in clipped_parts:
+                        if part.is_empty:
+                            continue
+                        
+                        exterior = [[round(c[0], 6), round(c[1], 6)] for c in part.exterior.coords]
+                        holes = [[[round(c[0], 6), round(c[1], 6)] for c in hole.coords] for hole in part.interiors]
+                        pb = [round(x, 6) for x in part.bounds]
+                        
+                        final_level = final_level_cache[level]
+                        entry_index = len(local_depth_entries)
+                        
+                        local_depth_entries.append({
+                            "b": pb,
+                            "d": final_level,
+                            "p": [exterior] + holes,
+                        })
+                        local_cell_refs.setdefault((cx, cy), []).append(entry_index)
+                        
+        return local_depth_entries, local_cell_refs
     
     def _generate_ocean_depth_tiles(self):
         """
