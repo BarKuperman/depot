@@ -62,6 +62,7 @@ class MapGen:
                         LineStrings based on the zoom level.
     load_bathymetry_data : Connects to GEBCO's bathymetry data via OPeNDAP 
                            and processes it into SB's ocean_depths_index format.
+    _process_columns_worker : Worker function for ocean depth index creation.
     _generate_ocean_depth_tiles : Creates ocean_foundations mbtiles from the 
                                   ocean_depth_index.json.
     _get_kind_and_rank : Helper to map OSM/Planetiler tags to game-engine 
