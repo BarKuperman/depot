@@ -941,9 +941,22 @@ class MapGen:
         # New binary format for buildings index
         self.create_buildings_index_binary(cleaned_json)
         
-    def process_roads_and_aeroways(self):
+    def process_roads_and_aeroways(self, roads_list=['motorway', 'motorway_link', 
+                                                     'trunk', 'trunk_link', 
+                                                     'primary', 'primary_link', 
+                                                     'secondary', 'secondary_link', 
+                                                     'tertiary', 'tertiary_link', 
+                                                     'unclassified', 'residential']):
         """
         Extracts roads and aeroways, applies JQ filters and buffering.
+
+        Inputs
+        ------
+        roads_list: list, strings. Road types to include in the extraction.
+                    Default: ['motorway', 'motorway_link', 'trunk', 'trunk_link', 
+                              'primary', 'primary_link', 'secondary', 
+                              'secondary_link', 'tertiary', 'tertiary_link', 
+                              'unclassified', 'residential']
         """
         if self.verb:
             print("***** Processing Roads and Aeroways *****")
@@ -952,9 +965,7 @@ class MapGen:
         roads_geojson = os.path.join(self.city_dir, "roads.geojson")
         
         # 1. Roads
-        roads_list = "motorway,motorway_link,trunk,trunk_link,primary,"\
-                     "primary_link,secondary,secondary_link,tertiary,"\
-                     "tertiary_link,unclassified,residential"
+        roads_str = ",".join(roads_list)
         self._run_command(["osmium", "tags-filter", city_pbf, 
                            f"w/highway={roads_list}", "-o", roads_pbf, 
                            "--overwrite"])
