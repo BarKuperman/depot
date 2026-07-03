@@ -1270,7 +1270,8 @@ class MapGen:
                                                 np.arange(1000, 11000, 1000)))[::-1]
             DEPTH_LEVELS = DEPTH_LEVELS[DEPTH_LEVELS >= depth_min]
             # Ensure the deepest point is its own level
-            DEPTH_LEVELS = np.insert(DEPTH_LEVELS, 0, depth_min)
+            if depth_min not in DEPTH_LEVELS:
+                DEPTH_LEVELS = np.insert(DEPTH_LEVELS, 0, depth_min)
             if self.verb:
                 print("  Depth levels:", DEPTH_LEVELS)
             
