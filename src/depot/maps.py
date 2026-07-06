@@ -967,7 +967,7 @@ class MapGen:
         # 1. Roads
         roads_str = ",".join(roads_list)
         self._run_command(["osmium", "tags-filter", city_pbf, 
-                           f"w/highway={roads_list}", "-o", roads_pbf, 
+                           f"w/highway={roads_str}", "-o", roads_pbf, 
                            "--overwrite"])
         this_dir = os.path.dirname(os.path.abspath(__file__))
         self._run_command(["osmium", "export", roads_pbf, 
