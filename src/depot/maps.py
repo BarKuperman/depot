@@ -8,7 +8,7 @@ import struct
 import gzip
 import math
 import xarray as xr
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import sqlite3
 import zlib
@@ -16,6 +16,7 @@ import mapbox_vector_tile
 import duckdb
 import geopandas as gpd
 import pandas as pd
+import shapely
 from shapely import wkb, set_precision
 from shapely.ops import unary_union, orient
 from shapely.geometry import shape, mapping, box, Polygon, MultiPolygon, Point, LineString
@@ -23,6 +24,7 @@ from shapely.strtree import STRtree
 import matplotlib.pyplot as plt
 import mercantile
 from scipy.interpolate import RegularGridInterpolator
+from tqdm import tqdm
 
 import depot.utils as U
 
@@ -60,6 +62,7 @@ class MapGen:
                         LineStrings based on the zoom level.
     load_bathymetry_data : Connects to GEBCO's bathymetry data via OPeNDAP 
                            and processes it into SB's ocean_depths_index format.
+    _process_columns_worker : Worker function for ocean depth index creation.
     _generate_ocean_depth_tiles : Creates ocean_foundations mbtiles from the 
                                   ocean_depth_index.json.
     _get_kind_and_rank : Helper to map OSM/Planetiler tags to game-engine 
@@ -96,7 +99,7 @@ class MapGen:
                        building_tile_filter_size=None, 
                        building_index_simplification=1,
                        building_tile_simplification=1,
-                       max_building_tile_size=450,
+                       max_building_tile_size=None,
                        cities=None, suburbs=None, neighborhoods=None,
                        cities_additional=None, suburbs_additional=None, 
                        neighborhoods_additional=None, 
@@ -107,7 +110,7 @@ class MapGen:
                        reprocess_bathymetry_data=False, 
                        color_military_like_aerodrome=True,
                        maxzoom=15, 
-                       ncores=1, RAM=4, cleanup_files=True, verb=True):
+                       ncores=1, RAM=4, cleanup_files=True, verb=True, debug=False):
         """
         Inputs
         ------
@@ -142,11 +145,13 @@ class MapGen:
         building_tile_simplification: int or float. Like 
                                 `building_index_simplification`, but for the 
                                 buildings in the pmtiles file.
-        max_building_tile_size: int. Maximum size per tile in KB when 
-                                considering only buildings. The absolute 
-                                maximum per tile is 500, which includes 
-                                buildings, rivers, roads, and more.
-                                Default: 450
+        max_building_tile_size: int or None. Maximum size per tile in KB when 
+                                considering only buildings. 
+                                Normally pmtiles are capped at 500 kb per tile 
+                                for performance reasons; users may wish to 
+                                adopt the same for their maps.
+                                If None, no limit is enforced. 
+                                Default: None
         cities: list of str. OSM 'place' values to show at the lowest zooms.
                              If None, labels will not be created for that zoom.
         suburbs: list of str. Like cities, but for medium zooms.
@@ -219,8 +224,12 @@ class MapGen:
                              Default: True
         verb: bool. Determines whether to print additional info or not.
                     Default: True
+        debug: bool. Determines whether to output some additional details to 
+                     the pmtiles file that are not needed but can be helpful.
+                     Default: False
         """
         self.verb = bool(verb)
+        self.debug = bool(debug)
         # Ensure the environment is set up correctly
         self._validate_env()
         
@@ -267,11 +276,13 @@ class MapGen:
         self.building_tile_simplification  = building_tile_simplification
 
         # Maximum size per tile for buildings
-        if max_building_tile_size > 500 or max_building_tile_size < 100:
-            raise ValueError("`max_building_tile_size` must be >=100 and "
-                            f"<=500.\nReceived: {max_building_tile_size}")
-        self.max_building_tile_size = int(max_building_tile_size) * 1000
-                           
+        self.max_building_tile_size = max_building_tile_size
+        if self.max_building_tile_size is not None:
+            if self.max_building_tile_size < 100:
+                raise ValueError("`max_building_tile_size` should be >=100"
+                                f"\nReceived: {self.max_building_tile_size}")
+            self.max_building_tile_size = int(max_building_tile_size) * 1000
+        
         # Labels
         self.cities = cities
         self.suburbs = suburbs
@@ -298,14 +309,15 @@ class MapGen:
             print("------------------------------")
             print(f"city                : {self.city}")
             print(f"bbox                : {self.bbox}")
-            print(f"osmpbf source files : {self.osmpbf_sources}")
             print(f"redownload_buildings: {self.REFETCH_BUILDINGS}")
+            print(f"osmpbf source files : {self.osmpbf_sources}")
             print(f"create_building_foundations  : {self.create_building_foundations}")
             print(f"create_ocean_foundations     : {self.create_ocean_foundations}")
             print(f"reprocess_bathymetry_data    : {self.reprocess_bathymetry_data}")
             print(f"color_military_like_aerodrome: {self.color_military_like_aerodrome}")
             print(f"building_index_filter_size   : {self.building_index_filter_size} m2")
             print(f"building_tile_filter_size    : {self.building_tile_filter_size} m2")
+            print(f"max_building_tile_size       : {self.max_building_tile_size}")
             print(f"maxzoom      : {self.maxzoom}")
             print(f"ncores       : {self.ncores}")
             print(f"RAM          : {self.RAM} MB")
@@ -572,6 +584,9 @@ class MapGen:
             try:
                 # Parse geometry via Shapely
                 geom_shape = shape(geom)
+                
+                if geom_shape.is_empty:
+                    continue
 
                 # Handle MultiPolygons
                 if isinstance(geom_shape, MultiPolygon):
@@ -938,9 +953,22 @@ class MapGen:
         # New binary format for buildings index
         self.create_buildings_index_binary(cleaned_json)
         
-    def process_roads_and_aeroways(self):
+    def process_roads_and_aeroways(self, roads_list=['motorway', 'motorway_link', 
+                                                     'trunk', 'trunk_link', 
+                                                     'primary', 'primary_link', 
+                                                     'secondary', 'secondary_link', 
+                                                     'tertiary', 'tertiary_link', 
+                                                     'unclassified', 'residential']):
         """
         Extracts roads and aeroways, applies JQ filters and buffering.
+
+        Inputs
+        ------
+        roads_list: list, strings. Road types to include in the extraction.
+                    Default: ['motorway', 'motorway_link', 'trunk', 'trunk_link', 
+                              'primary', 'primary_link', 'secondary', 
+                              'secondary_link', 'tertiary', 'tertiary_link', 
+                              'unclassified', 'residential']
         """
         if self.verb:
             print("***** Processing Roads and Aeroways *****")
@@ -949,11 +977,9 @@ class MapGen:
         roads_geojson = os.path.join(self.city_dir, "roads.geojson")
         
         # 1. Roads
-        roads_list = "motorway,motorway_link,trunk,trunk_link,primary,"\
-                     "primary_link,secondary,secondary_link,tertiary,"\
-                     "tertiary_link,unclassified,residential"
+        roads_str = ",".join(roads_list)
         self._run_command(["osmium", "tags-filter", city_pbf, 
-                           f"w/highway={roads_list}", "-o", roads_pbf, 
+                           f"w/highway={roads_str}", "-o", roads_pbf, 
                            "--overwrite"])
         this_dir = os.path.dirname(os.path.abspath(__file__))
         self._run_command(["osmium", "export", roads_pbf, 
@@ -1019,8 +1045,10 @@ class MapGen:
         clean_mbtiles = f"{path_prefix}-clean.mbtiles"
         fixed_mbtiles = f"{path_prefix}-fixed.mbtiles"
         merged_mbtiles = f"{path_prefix}-merged.mbtiles"
+        foundations_mbtiles = f"{path_prefix}-foundations.mbtiles"
         self.buildings_mbtiles = os.path.join(self.city_dir, "buildings.mbtiles")
         final_pmtiles = os.path.join(self.city_dir, self.city+"-nolabels.pmtiles")
+        foundations_pmtiles = os.path.join(self.city_dir, self.city+"_foundations.pmtiles")
         
         # 1. Planetiler
         bounds_str = ",".join(map(str, self.bbox))
@@ -1064,8 +1092,6 @@ class MapGen:
         # 4. Building overlays, including foundations
         self._generate_building_tiles()
         
-
-
         # Clean metadata
         self._update_mbtiles_metadata(fixed_mbtiles)
         self._update_mbtiles_metadata(self.buildings_mbtiles)
@@ -1076,17 +1102,14 @@ class MapGen:
             "-o", merged_mbtiles,
             fixed_mbtiles, self.buildings_mbtiles
         ]
-        if self.create_building_foundations:
-            merge_cmd.append(self.buildings_foundations_mbtiles)
         if self.create_ocean_foundations:
             merge_cmd.append(self.ocean_foundations_mbtiles)
+        merge_cmd.append("--no-tile-size-limit")
         self._run_command(merge_cmd)
         
         if self.cleanup_files:
             os.remove(fixed_mbtiles)
             os.remove(self.buildings_mbtiles)
-            if self.create_building_foundations:
-                os.remove(self.buildings_foundations_mbtiles)
             if self.create_ocean_foundations:
                 os.remove(self.ocean_foundations_mbtiles)
         
@@ -1094,9 +1117,17 @@ class MapGen:
         self._update_mbtiles_metadata(merged_mbtiles)
         self._run_command(["pmtiles", "convert", merged_mbtiles, 
                            final_pmtiles])
+        if self.create_building_foundations:
+            self._update_mbtiles_metadata(self.buildings_foundations_mbtiles)
+            self._run_command(["pmtiles", "convert", 
+                               self.buildings_foundations_mbtiles, 
+                               foundations_pmtiles])
         
         if self.cleanup_files:
             os.remove(merged_mbtiles)
+            #os.remove(foundations_mbtiles)
+            if self.create_building_foundations:
+                os.remove(self.buildings_foundations_mbtiles)
         
     def _apply_jq(self, filepath, filter_str):
         """
@@ -1182,7 +1213,7 @@ class MapGen:
     
     def load_bathymetry_data(self, opendap_url="https://dap.ceda.ac.uk/thredds/dodsC/bodc/gebco/global/gebco_2026/sub_ice_topography_bathymetry/netcdf/GEBCO_2026_sub_ice.nc", 
                              buffer=0.05, CELL_SIZE=0.0027,
-                             depth_step=4, resolution_multiplier=4):
+                             resolution_multiplier=4):
         """
         Connects to GEBCO's bathymetry data via OPeNDAP and processes 
         it into SB's ocean_depths_index format.
@@ -1200,9 +1231,6 @@ class MapGen:
                    performance. Don't change this number unless you have a 
                    very good reason.
                    Default: 0.0027
-        depth_step: int. Step size in meters between depth layers for ingame 
-                    ocean depth map layer. Vanilla maps use 4 m.
-                    Default: 4
         resolution_multiplier: int or float. Multiplier for the resolution of 
                                the bathymetry data. Smooths the contours at 
                                the cost of increased file sizes. Use 1 for no 
@@ -1250,11 +1278,17 @@ class MapGen:
         
         if depths.min() < 0:
             # Set up depth contour levels (strictly below sea level)
-            true_min = float(depths.min())
-            interval_start = int(np.ceil(true_min / float(depth_step)) * int(depth_step))
-            clean_steps = np.arange(interval_start, 0.1, int(depth_step)) 
-            DEPTH_LEVELS = np.unique(np.insert(clean_steps, 0, true_min))
-            DEPTH_LEVELS = DEPTH_LEVELS[DEPTH_LEVELS < 0] 
+            depth_min = float(depths.min())
+            # Standard grid of depths - reverse it so it goes deepest -> shallowest
+            DEPTH_LEVELS = -1 * np.concatenate((np.arange(   0,    40,    5, dtype=float), 
+                                                np.arange(  40,   100,   10, dtype=float), 
+                                                np.arange( 100,   500,   50, dtype=float),
+                                                np.arange( 500,  1000,  100, dtype=float),
+                                                np.arange(1000, 11000, 1000, dtype=float)))[::-1]
+            DEPTH_LEVELS = DEPTH_LEVELS[DEPTH_LEVELS > depth_min]
+            DEPTH_LEVELS = np.insert(DEPTH_LEVELS, 0, depth_min)
+            if self.verb:
+                print("  Depth levels:", DEPTH_LEVELS)
             
             # Increase the resolution multiplier for smoother curves
             dense_lons = np.linspace(lons[0], lons[-1], len(lons) * resolution_multiplier)
@@ -1465,15 +1499,15 @@ class MapGen:
             if self.verb:
                 print("  Patching water gaps at -4m depth")
             
-            # Find if a -4m layer index already exists in contours_by_level
-            minus_4_idx = next((i for i, (lvl, _) in enumerate(contours_by_level) if lvl == -4), None)
+            # Find if a -5m layer index already exists in contours_by_level
+            minus_5_idx = next((i for i, (lvl, _) in enumerate(contours_by_level) if lvl == -5), None)
             
-            if minus_4_idx is not None:
-                existing_4m_geom = contours_by_level[minus_4_idx][1]
-                updated_4m_geom = unary_union([existing_4m_geom, water_gaps])
-                contours_by_level[minus_4_idx] = (-4, updated_4m_geom)
+            if minus_5_idx is not None:
+                existing_5m_geom = contours_by_level[minus_5_idx][1]
+                updated_5m_geom = unary_union([existing_5m_geom, water_gaps])
+                contours_by_level[minus_5_idx] = (-5, updated_5m_geom)
             else:
-                contours_by_level.append((-4, water_gaps))
+                contours_by_level.append((-5, water_gaps))
         
         # Process cells
         depth_entries = []
@@ -1516,55 +1550,64 @@ class MapGen:
         }
 
         # Evaluate cells
-        for cx in range(len(grid_x)):
-            cell_min_x = min_lon + (cx * step_x)
-            cell_max_x = min_lon + ((cx + 1) * step_x)
+        if self.verb:
+            print("  Evaluating cells")
+        
+        # Sanitize contours
+        valid_water_contours = []
+        for level, geom in water_clipped_contours:
+            if not shapely.is_valid(geom):
+                geom = shapely.make_valid(geom)
+            valid_water_contours.append((level, geom))
+
+        # Precompute Y bounds
+        y_bounds = [(min_lat + (cy * step_y), min_lat + ((cy + 1) * step_y)) for cy in range(len(grid_y))]
+        
+        # Select optimal number of parallel workers
+        # Never use more than 1/2 the available cores
+        ncores = max(1, min(self.ncores, os.cpu_count() // 2))
+        if self.verb:
+            core_str = "core" if ncores == 1 else "cores"
+            print(f"  Processing ocean depth indices using {ncores} {core_str}")
+        
+        all_cx = list(range(len(grid_x)))
+        chunk_size = int(math.ceil(len(all_cx) / ncores / 50))
+        cx_chunks = [all_cx[i:i + chunk_size] for i in range(0, len(all_cx), chunk_size)]
+        
+        # Calculate depth indices in parallel
+        parallel_results = []
+        with ProcessPoolExecutor(max_workers=ncores) as executor:
+            # Submit all chunks to start running in parallel immediately
+            futures = {
+                executor.submit(
+                    self._process_columns_worker,
+                    chunk, min_lon, step_x, step_y, len(grid_y), y_bounds,
+                    spatial_tree, valid_water_contours, final_level_cache
+                ): chunk 
+                for chunk in cx_chunks
+            }
             
-            for cy in range(len(grid_y)):
-                cell_min_y = min_lat + (cy * step_y)
-                cell_max_y = min_lat + ((cy + 1) * step_y)
-                cell_poly = box(cell_min_x, cell_min_y, cell_max_x, cell_max_y)
-                
-                # Query the tree to return the matching integer indices instead of raw objects
-                intersecting_indices = spatial_tree.query(cell_poly)
-                
-                for idx in intersecting_indices:
-                    # Pull the original level and geometry using the stable list index
-                    level, level_geom = water_clipped_contours[idx]
+            with tqdm(total=len(futures), desc="Processing Grid Chunks", unit="chunk") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        parallel_results.append(result)
+                    except Exception as e:
+                        print(f"\n[ERROR] Chunk failed with exception: {e}")
                     
-                    # Short-circuit logic: Is the cell completely submerged within this level?
-                    if cell_poly.within(level_geom):
-                        clipped_parts = [cell_poly]
-                    else:
-                        clipped = cell_poly.intersection(level_geom)
-                        if clipped.is_empty or clipped.area <= 1e-9:
-                            continue
-                        clipped_parts = _iter_polygon_parts(clipped)
-                        
-                    for part in clipped_parts:
-                        if part.is_empty:
-                            continue
-                        
-                        # Clean up bounds and coords
-                        exterior_poly = Polygon(part.exterior)
-                        exterior = [[round(c[0], 6), round(c[1], 6)] 
-                                    for c in exterior_poly.exterior.coords]
-                        holes = [[[round(c[0], 6), round(c[1], 6)] 
-                                  for c in hole.coords] 
-                                 for hole in part.interiors]
-                        
-                        pb = [round(x, 6) for x in exterior_poly.bounds]
-                        
-                        final_level = final_level_cache[level]
-                        entry_index = len(depth_entries)
-                        
-                        depth_entries.append({
-                            "b": pb,
-                            "d": final_level,
-                            "p": [exterior] + holes,
-                        })
-                        
-                        cell_refs.setdefault((cx, cy), []).append(entry_index)
+                    pbar.update(1)
+
+        # Merge isolated process outputs sequentially back into the instance payload
+        depth_entries = []
+        cell_refs = {}
+        global_entry_offset = 0
+
+        for local_depth_entries, local_cell_refs in parallel_results:
+            depth_entries.extend(local_depth_entries)
+            for (cx, cy), indices in local_cell_refs.items():
+                global_indices = [idx + global_entry_offset for idx in indices]
+                cell_refs.setdefault((cx, cy), []).extend(global_indices)
+            global_entry_offset += len(local_depth_entries)
         
         # Format sparse lookup list
         cells = [
@@ -1575,7 +1618,6 @@ class MapGen:
         # Format for game and save
         all_depths = [d['d'] for d in depth_entries]
         min_d = min(all_depths) if all_depths else 0.0
-        max_d = max(all_depths) if all_depths else 0.0
 
         self.bathy_data = {
             "cs": float(CELL_SIZE),
@@ -1596,6 +1638,68 @@ class MapGen:
         
         if self.verb:
             print(f"Successfully generated ocean depth index. Processed {len(cells)} active grid cells.")
+    
+    @staticmethod
+    def _process_columns_worker(cx_chunk, min_lon, step_x, step_y, grid_y_len, y_bounds, 
+                                spatial_tree, valid_water_contours, final_level_cache):
+        """
+        Processes water depth index in an isolated process. 
+        No access to `self` to avoid Pickling Errors.
+        """
+        local_depth_entries = []
+        local_cell_refs = {}
+        
+        def _iter_polygon_parts(geom):
+            if geom.geom_type == "Polygon":
+                return [geom]
+            elif geom.geom_type == "MultiPolygon":
+                return list(geom.geoms)
+            return []
+
+        for cx in cx_chunk:
+            cell_min_x = min_lon + (cx * step_x)
+            cell_max_x = min_lon + ((cx + 1) * step_x)
+            
+            for cy in range(grid_y_len):
+                cell_min_y, cell_max_y = y_bounds[cy]
+                cell_poly = box(cell_min_x, cell_min_y, cell_max_x, cell_max_y)
+                
+                intersecting_indices = spatial_tree.query(cell_poly)
+                
+                for idx in intersecting_indices:
+                    level, level_geom = valid_water_contours[idx]
+                    
+                    if cell_poly.within(level_geom):
+                        clipped_parts = [cell_poly]
+                    else:
+                        clipped = shapely.clip_by_rect(
+                            level_geom, 
+                            cell_min_x, cell_min_y, 
+                            cell_max_x, cell_max_y
+                        )
+                        if clipped.is_empty or clipped.area <= 1e-9:
+                            continue
+                        clipped_parts = _iter_polygon_parts(clipped)
+                        
+                    for part in clipped_parts:
+                        if part.is_empty:
+                            continue
+                        
+                        exterior = [[round(c[0], 6), round(c[1], 6)] for c in part.exterior.coords]
+                        holes = [[[round(c[0], 6), round(c[1], 6)] for c in hole.coords] for hole in part.interiors]
+                        pb = [round(x, 6) for x in part.bounds]
+                        
+                        final_level = final_level_cache[level]
+                        entry_index = len(local_depth_entries)
+                        
+                        local_depth_entries.append({
+                            "b": pb,
+                            "d": final_level,
+                            "p": [exterior] + holes,
+                        })
+                        local_cell_refs.setdefault((cx, cy), []).append(entry_index)
+                        
+        return local_depth_entries, local_cell_refs
     
     def _generate_ocean_depth_tiles(self):
         """
@@ -1622,6 +1726,7 @@ class MapGen:
         tippe_cmd = [
             "tippecanoe", "-o", self.ocean_foundations_mbtiles,
             "--layer=ocean_foundations", "--include=depth_min", "--include=kind", 
+            "--no-tile-size-limit", 
             "-Z8", f"-z{self.maxzoom}", self.ocean_foundations_geojson, "--force"
         ]
         self._run_command(tippe_cmd)
@@ -1720,20 +1825,34 @@ class MapGen:
                 elif (kind == 'aeroway' or \
                       'runway' in str(old_props).lower() or \
                       'taxiway' in str(old_props).lower()):
-                    dest, final_kind, final_rank = "roads", "aeroway", 400
-                    if not detail:
-                        detail = (
-                            'runway' if 'runway' in str(old_props).lower() 
-                            else 'taxiway'
-                        )
+                    if self.debug:
+                        dest, final_kind, final_rank = "roads", "aeroway", 400
+                        if not detail:
+                            detail = (
+                                'runway' if 'runway' in str(old_props).lower() 
+                                else 'taxiway'
+                            )
+                    else:
+                        # Map layer not needed - runways_taxiways.geojson handles this
+                        continue
                 elif kind == 'aerodrome':
                     dest, final_kind, final_rank = "landuse", "aerodrome", 189
                 elif is_bldg_layer or kind == 'building':
                     dest, final_kind, final_rank = "buildings", "building", 400
                 elif layer_name in ["transportation", "roads", "navigation"]:
-                    dest, final_kind, final_rank = "roads", kind, rank
-                else:
+                    if self.debug:
+                        dest, final_kind, final_rank = "roads", kind, rank
+                    else:
+                        # Map layer not needed - roads.geojson handles this
+                        continue
+                elif kind in ['college', 'commercial', 'industrial', 
+                              'residential', 'retail', 'school', 'university']:
+                    dest, final_kind, final_rank = kind, kind, rank
+                elif kind == 'park':
                     dest, final_kind, final_rank = "landuse", kind, rank
+                else:
+                    # Not keeping this feature - drop it
+                    continue
 
                 props = {'kind': final_kind, 'sort_rank': final_rank}
                 if detail: props['kind_detail'] = detail
@@ -1876,7 +1995,7 @@ class MapGen:
                 feat["geometry"] = mapping(geom)
                 kept.append(feat)
             new_layers_data["landuse"] = kept
-
+        
         layers_to_encode = []
         for name, feats in new_layers_data.items():
             if not feats: continue
@@ -1886,9 +2005,6 @@ class MapGen:
                                      "extent": 4096, 
                                      "version": 2})
 
-        if not layers_to_encode:
-            return (z, x, y, data)
-        
         return (
             z, x, y, zlib.compress(mapbox_vector_tile.encode(layers_to_encode))
         )
@@ -1918,8 +2034,7 @@ class MapGen:
                   f"cores...")
         
         with ProcessPoolExecutor(max_workers=self.ncores) as executor:
-            results = list(executor.map(self._process_tile_worker, 
-                                        all_tiles))
+            results = list(executor.map(self._process_tile_worker, all_tiles))
 
         # Setup output database
         out_conn = sqlite3.connect(output_path)
@@ -1989,11 +2104,15 @@ class MapGen:
         self._set_default_building_height()
         
         # Convert to Vector Tiles with Tippecanoe
+        if self.max_building_tile_size is not None:
+            building_tile_params = ["--drop-smallest-as-needed",
+                f"--maximum-tile-bytes={self.max_building_tile_size}"]
+        else:
+            building_tile_params = ["--no-tile-size-limit"]
         tippe_cmd = [
             "tippecanoe", "-o", self.buildings_mbtiles,
-            "--layer=buildings", "--include=height", "--drop-smallest-as-needed",
-            f"--maximum-tile-bytes={self.max_building_tile_size}", 
-            "-Z12", f"-z{self.maxzoom}", self.buildings_zoom_geojson, "--force"
+            "--layer=buildings", "--include=height"] + building_tile_params + \
+           ["-Z12", f"-z{self.maxzoom}", self.buildings_zoom_geojson, "--force"
         ]
         self._run_command(tippe_cmd)
         
@@ -2018,7 +2137,7 @@ class MapGen:
             val = props.get('height')
 
             # Force the key to exist and be a float
-            if val is None or val == "":
+            if val is None or val == "" or float(val) <= 0:
                 props['height'] = float(default_height)
             else:
                 try:
@@ -2066,11 +2185,15 @@ class MapGen:
         with open(self.buildings_foundations_geojson, 'w', encoding='utf-8') as f:
             json.dump(geojson_data, f, indent=2)
         
+        if self.max_building_tile_size is not None:
+            building_tile_params = ["--drop-smallest-as-needed",
+                f"--maximum-tile-bytes={self.max_building_tile_size}"]
+        else:
+            building_tile_params = ["--no-tile-size-limit"]
         tippe_cmd = [
             "tippecanoe", "-o", self.buildings_foundations_mbtiles,
-            "--layer=foundations", "--include=foundationDepth", "--drop-smallest-as-needed",
-            f"--maximum-tile-bytes={self.max_building_tile_size}", 
-            "-Z12", f"-z{self.maxzoom}", self.buildings_foundations_geojson, "--force"
+            "--layer=foundations", "--include=foundationDepth"] + building_tile_params +\
+           ["-Z12", f"-z{self.maxzoom}", self.buildings_foundations_geojson, "--force"
         ]
         self._run_command(tippe_cmd)
         
@@ -2265,7 +2388,7 @@ class MapGen:
         bbox_clean = ",".join(map(str, self.bbox))
         tippe_cmd = [
             "tippecanoe", "-Z", "6", "-z", f"{self.maxzoom}", "-r", "1", "-y", "name",
-            "-o", labels_only_pmtiles,
+            "-o", labels_only_pmtiles, "--no-tile-size-limit",
             f"--clip-bounding-box={bbox_clean}",
             "--force"
         ]
@@ -2286,7 +2409,7 @@ class MapGen:
         self._run_command(["tile-join", "-o", 
                            final_mbtiles, 
                            no_labels_pmtiles, labels_only_pmtiles,
-                           '--force'])
+                           "--no-tile-size-limit", "--force"])
         self._update_mbtiles_metadata(final_mbtiles)
         self._run_command(["pmtiles", "convert", final_mbtiles, 
                            final_output])

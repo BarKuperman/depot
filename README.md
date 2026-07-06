@@ -98,6 +98,7 @@ custom maps.  This is handled through the `MapGen` class.
 | `cleanup_files`    | bool. If True, deletes some intermediate files that are created and used within the same function. Default: True         |
 | `RAM`              | int or float. Sets the amount of RAM in GB to use when calling mapshaper.  If you get heap allocation errors, increase this value.  Keep in mind your OS and other programs still need to run, so don't try to allocate your system's full RAM amount. Default: 4         |
 | `verb`             | bool. Determines whether to print additional info or not. Default: True        |
+| `debug`            | bool. Determines whether to output additional info to the pmtiles file (may control more in the future). Default: False |
 
 ### `MapGen` methods that you care about
 | Class method                 | Description                                                    |
